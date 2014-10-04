@@ -7,24 +7,38 @@ import "encoding/binary"
 import "time"
 import "io"
 import "strings"
+import "code.google.com/p/go.crypto/nacl/box"
+import "code.google.com/p/go.crypto/curve25519"
+import "crypto/rand"
+import "bytes"
+import "github.com/hlandau/parazmq/rawsession"
 
 type Socket interface {
+
+}
+
+type socket struct {
+  socketType string
+}
+
+
+type Session interface {
   Close() error
   Write(msg [][]byte) error
   Read() (msg [][]byte, err error)
 }
 
-type socket struct {
+type session struct {
   conn net.Conn
   mechanism string
 
   remoteIsServer bool
   remoteIdentity string
-  remoteSocketType string
+  remoteSessionType string
 
   maxRead uint64
   identity string
-  socketType string
+  sessionType string
   authIsServer bool
 
   plainUsername string
@@ -34,10 +48,27 @@ type socket struct {
 
   closed bool
   lastTouch time.Time
+
+  rs *rawsession.RawSession
 }
 
-func Connect(socketType string, URL string) (si Socket, err error) {
-  s := socket{}
+type SessionConfig struct {
+  AuthMechanism string
+  AuthIsServer  bool
+  SessionType   string
+  Identity      string
+  MaxRead       uint64
+  Dialer        net.Dialer
+
+  AuthPlainUsername string
+  AuthPlainPassword string
+
+  AuthCurvek [32]byte // own private key
+  AuthCurveS [32]byte // server's public key (required only if we are a client)
+}
+
+func Connect(URL string, cfg SessionConfig) (si Session, err error) {
+  s := session{}
 
   // tcp://hostname:port
   // tcp://hostname:port/resource
@@ -53,23 +84,38 @@ func Connect(socketType string, URL string) (si Socket, err error) {
     return
   }
 
-  if !validSocketType(socketType) {
-    err = errors.New("invalid socket type")
+  if !validSessionType(cfg.SessionType) {
+    err = errors.New("invalid session type")
     return
   }
 
-  c, err := net.Dial("tcp", u.Host)
+  if !validMechanism(cfg.AuthMechanism) {
+    err = errors.New("invalid mechanism")
+    return
+  }
+
+  s.mechanism = cfg.AuthMechanism
+  s.sessionType = cfg.SessionType
+  s.authIsServer = cfg.AuthIsServer
+  s.identity = cfg.Identity
+  s.maxRead = cfg.MaxRead
+  s.plainUsername = cfg.AuthPlainUsername
+  s.plainPassword = cfg.AuthPlainPassword
+
+  c, err := cfg.Dialer.Dial("tcp", u.Host)
   if err != nil {
     return
   }
-
   s.conn = c
-  s.mechanism = "NULL"
-  s.socketType = socketType
 
   err = s.greeting()
   if err != nil {
     s.conn.Close()
+    return
+  }
+
+  s.rs, err = rawsession.New(c, rawsession.ZMTP3_0)
+  if err != nil {
     return
   }
 
@@ -83,7 +129,7 @@ func Connect(socketType string, URL string) (si Socket, err error) {
   return
 }
 
-func validSocketType(st string) bool {
+func validSessionType(st string) bool {
   switch st {
     case "REQ","REP","ROUTER","DEALER","PUB","SUB","XPUB","XSUB","PUSH","PULL","PAIR":
       return true
@@ -92,7 +138,16 @@ func validSocketType(st string) bool {
   }
 }
 
-func (self *socket) Close() error {
+func validMechanism(m string) bool {
+  switch m {
+    case "NULL", "PLAIN", "CURVE":
+      return true
+    default:
+      return false
+  }
+}
+
+func (self *session) Close() error {
   if self.closed {
     return nil
   }
@@ -106,7 +161,7 @@ func (self *socket) Close() error {
   return nil
 }
 
-func (self *socket) Write(msg [][]byte) error {
+func (self *session) Write(msg [][]byte) error {
   for i := range msg {
     f := zmtpFlags(0)
     if i < len(msg)-1 {
@@ -121,7 +176,7 @@ func (self *socket) Write(msg [][]byte) error {
   return nil
 }
 
-func (self *socket) Read() (data [][]byte, err error) {
+func (self *session) Read() (data [][]byte, err error) {
   for {
     var fdata  []byte
     var fflags zmtpFlags
@@ -147,7 +202,7 @@ func (self *socket) Read() (data [][]byte, err error) {
   return
 }
 
-func (self *socket) greeting() error {
+func (self *session) greeting() error {
   err := self.sendGreeting()
   if err != nil {
     return err
@@ -161,9 +216,9 @@ func (self *socket) greeting() error {
   return nil
 }
 
-func (self *socket) sendGreeting() error {
+func (self *session) sendGreeting() error {
   if len(self.mechanism) > 20 {
-    panic("oversize mechanism name")
+    panic("oversized mechanism name")
   }
 
   asServer := byte(0)
@@ -189,7 +244,7 @@ func (self *socket) sendGreeting() error {
   return nil
 }
 
-func (self *socket) receiveGreeting() error {
+func (self *session) receiveGreeting() error {
   greeting   := make([]byte, 64)
 
   _, err := io.ReadFull(self.conn, greeting)
@@ -215,41 +270,10 @@ func (self *socket) receiveGreeting() error {
   return nil
 }
 
-type zmtpFlags byte
-const (
-  zf_More     zmtpFlags = 1<<0
-  zf_Long               = 1<<1
-  zf_Command            = 1<<2
-)
-
-func (self *socket) sendErrorCommand(errMsg string) error {
-  if len(errMsg) > 255 {
-    panic("error message too long")
-  }
-
-  buf    := make([]byte, 1+len(errMsg))
-  buf[0]  = byte(len(errMsg))
-  copy(buf[1:], []byte(errMsg))
-  return self.sendCommand("ERROR", buf)
-}
-
-func (self *socket) sendCommand(cmdName string, cmdData []byte) error {
-  if len(cmdName) > 255 {
-    panic("command name too long")
-  }
-
-  buf := make([]byte, 1+len(cmdName)+len(cmdData))
-  buf[0] = byte(len(cmdName))
-  copy(buf[1:], []byte(cmdName))
-  copy(buf[1+len(cmdName):], cmdData)
-
-  return self.sendRawFrame(buf, zf_Command)
-}
-
 // This processes incoming commands after the handshake is complete. Incoming
 // commands received during authentication are processed separately in the
 // handshake methods.
-func (self *socket) processIncomingCommand(data []byte) error {
+func (self *session) processIncomingCommand(data []byte) error {
   cmdName, cmdData, err := self.parseCommand(data)
   if err != nil {
     return err
@@ -271,13 +295,13 @@ func (self *socket) processIncomingCommand(data []byte) error {
   return nil
 }
 
-func (self *socket) isPub() bool {
-  return self.socketType == "PUB" || self.socketType == "XPUB"
+func (self *session) isPub() bool {
+  return self.sessionType == "PUB" || self.sessionType == "XPUB"
 }
 
-func (self *socket) processIncomingSubscribe(cmdData []byte) error {
+func (self *session) processIncomingSubscribe(cmdData []byte) error {
   if !self.isPub() {
-    return fmt.Errorf("Got SUBSCRIBE command on non-PUB/XPUB socket.")
+    return fmt.Errorf("Got SUBSCRIBE command on non-PUB/XPUB session.")
   }
 
   // TODO
@@ -285,9 +309,9 @@ func (self *socket) processIncomingSubscribe(cmdData []byte) error {
   return nil
 }
 
-func (self *socket) processIncomingCancel(cmdData []byte) error {
+func (self *session) processIncomingCancel(cmdData []byte) error {
   if !self.isPub() {
-    return fmt.Errorf("Got CANCEL command on non-PUB/XPUB socket.")
+    return fmt.Errorf("Got CANCEL command on non-PUB/XPUB session.")
   }
 
   // TODO
@@ -295,7 +319,7 @@ func (self *socket) processIncomingCancel(cmdData []byte) error {
   return nil
 }
 
-func (self *socket) processIncomingPing(cmdData []byte) error {
+func (self *session) processIncomingPing(cmdData []byte) error {
   if len(cmdData) < 2 {
     return fmt.Errorf("received malformed PING command")
   }
@@ -303,7 +327,7 @@ func (self *socket) processIncomingPing(cmdData []byte) error {
   return self.sendCommand("PONG", cmdData[2:])
 }
 
-func (self *socket) processIncomingPong(cmdData []byte) error {
+func (self *session) processIncomingPong(cmdData []byte) error {
   // We ignore this because ANY incoming data results in a touch.
   // For this reason there's no point matching on the context value.
 
@@ -311,119 +335,47 @@ func (self *socket) processIncomingPong(cmdData []byte) error {
   return nil
 }
 
-func (self *socket) touch() {
+func (self *session) touch() {
   self.lastTouch = time.Now()
 }
 
-func (self *socket) receiveCommand() (cmdName string, cmdData []byte, err error) {
-  d, flags, err := self.receiveRawFrame()
-  if err != nil {
-    return
-  }
-
-  if (flags & zf_Command) == 0 {
-    err = fmt.Errorf("Expected to receive command frame, but got data frame.")
-    return
-  }
-
-  return self.parseCommand(d)
+func (self *session) sendRawFrameLL(data []byte, flags zmtpFlags) error {
+  return self.rs.SendFrame(data, flags)
 }
 
-func (self *socket) parseCommand(d []byte) (cmdName string, cmdData []byte, err error) {
-  if len(d) == 0 {
-    err = fmt.Errorf("Received a zero-length command frame.")
-    return
-  }
-
-  cmdNameLen := int(d[0])
-  if cmdNameLen+1 > len(d) {
-    err = fmt.Errorf("Received a malformed command frame.")
-    return
-  }
-
-  cmdName = string(d[1:1+cmdNameLen])
-  cmdData = d[1+cmdNameLen:]
-  return
+func (self *session) receiveRawFrameLL() ([]byte, zmtpFlags, error) {
+  return self.rs.ReceiveFrame()
 }
 
-func validFlags(flags zmtpFlags) bool {
-  if ((flags & zf_Command) != 0) {
-    return ((flags & zf_More) == 0)
-  }
-  return true
-}
-
-func (self *socket) sendRawFrame(data []byte, flags zmtpFlags) error {
-  if !validFlags(flags) {
-    panic(fmt.Sprintf("invalid flags specified: %d", flags))
-  }
-
-  hdr := make([]byte, 9)
-  if len(data) > 0xFF {
-    flags |= zf_Long
-    binary.BigEndian.PutUint64(hdr[1:], uint64(len(data)))
+func (self *session) sendRawFrame(data []byte, flags zmtpFlags) error {
+  if self.curveEngaged {
+    return self.sendRawFrameCurve(data, flags)
   } else {
-    hdr[1] = byte(len(data))
-    hdr = hdr[0:2]
+    return self.sendRawFrameLL(data, flags)
   }
-  hdr[0] = byte(flags)
-
-  _, err := self.conn.Write(hdr)
-  if err != nil {
-    return err
-  }
-
-  _, err = self.conn.Write(data)
-  if err != nil {
-    return err
-  }
-
-  return nil
 }
 
-func (self *socket) receiveRawFrame() (data []byte, flags zmtpFlags, err error) {
-  var L uint64
-  hdr := make([]byte, 9)
-
-  _, err = io.ReadFull(self.conn, hdr[0:2])
+func (self *session) receiveRawFrame() (data []byte, flags zmtpFlags, err error) {
+  data, flags, err = self.receiveRawFrameLL()
   if err != nil {
     return
   }
 
-  flags = zmtpFlags(hdr[0])
-  if !validFlags(flags) {
-    err = fmt.Errorf("Received malformed frame.")
-    return
-  }
-
-  if (flags & zf_Long) != 0 {
-    _, err = io.ReadFull(self.conn, hdr[2:9])
-    if err != nil {
-      return
+  if self.curveEngaged {
+    if (flags & zf_Command) != 0 {
+      if bytes.Equal(data[0:8], curveMessagePrefix) {
+        return self.receiveRawFrameCurve(data[8:])
+      } else {
+        // non-MESSAGE command, pass through (UNAUTHENTICATED)
+      }
+    } else {
+      err = fmt.Errorf("Got non-command message while CurveZMQ is engaged")
     }
-
-    L = binary.BigEndian.Uint64(hdr[1:])
-  } else {
-    L = uint64(hdr[1])
   }
-
-  flags = flags & (zf_Long^zmtpFlags(0xFF))
-
-  if self.maxRead != 0 && L > self.maxRead {
-    // TODO FAULT MODE
-    err = fmt.Errorf("Received frame in excess of the max read size.")
-    return
-  }
-
-  data = make([]byte, L)
-  _, err = io.ReadFull(self.conn, data)
-
-  self.touch()
-
   return
 }
 
-func (self *socket) handshake() error {
+func (self *session) handshake() error {
   switch self.mechanism {
     case "NULL":
       return self.handshakeNULL()
@@ -436,7 +388,7 @@ func (self *socket) handshake() error {
   }
 }
 
-func (self *socket) handshakeWaitForMetadata(inCmdName string) error {
+func (self *session) handshakeWaitForMetadata(inCmdName string) error {
   cmdName, cmdData, err := self.receiveCommand()
   if err != nil {
     return err
@@ -466,7 +418,7 @@ func (self *socket) handshakeWaitForMetadata(inCmdName string) error {
   return nil
 }
 
-func (self *socket) handshakeAsClientFinalStretch(outCmdName, inCmdName string) error {
+func (self *session) handshakeAsClientFinalStretch(outCmdName, inCmdName string) error {
   err := self.sendCommand(outCmdName, serializeMetadata(self.getOutgoingMetadata()))
   if err != nil {
     return err
@@ -480,7 +432,7 @@ func (self *socket) handshakeAsClientFinalStretch(outCmdName, inCmdName string) 
   return nil
 }
 
-func (self *socket) handshakeAsServerFinalStretch(inCmdName, outCmdName string) error {
+func (self *session) handshakeAsServerFinalStretch(inCmdName, outCmdName string) error {
   err := self.handshakeWaitForMetadata(inCmdName)
   if err != nil {
     return err
@@ -494,11 +446,11 @@ func (self *socket) handshakeAsServerFinalStretch(inCmdName, outCmdName string) 
   return nil
 }
 
-func (self *socket) handshakeNULL() error {
+func (self *session) handshakeNULL() error {
   return self.handshakeAsClientFinalStretch("READY", "READY")
 }
 
-func (self *socket) handshakePLAIN() error {
+func (self *session) handshakePLAIN() error {
   if self.authIsServer {
     return self.handshakePLAINAsServer()
   } else {
@@ -506,7 +458,7 @@ func (self *socket) handshakePLAIN() error {
   }
 }
 
-func (self *socket) handshakePLAINAsClient() error {
+func (self *session) handshakePLAINAsClient() error {
   if len(self.plainUsername) > 0xFF || len(self.plainPassword) > 0xFF {
     panic("Username or password is too long.")
   }
@@ -515,7 +467,7 @@ func (self *socket) handshakePLAINAsClient() error {
   buf[0] = byte(len(self.plainUsername))
   copy(buf[1:], []byte(self.plainUsername))
   buf[1+len(self.plainUsername)] = byte(len(self.plainPassword))
-  copy(buf[1+len(self.plainPassword)+1:], []byte(self.plainPassword))
+  copy(buf[1+len(self.plainUsername)+1:], []byte(self.plainPassword))
 
   err := self.sendCommand("HELLO", buf)
   if err != nil {
@@ -536,7 +488,7 @@ func (self *socket) handshakePLAINAsClient() error {
   return self.handshakeAsClientFinalStretch("INITIATE", "READY")
 }
 
-func (self *socket) handshakePLAINAsServer() error {
+func (self *session) handshakePLAINAsServer() error {
   cmdName, cmdData, err := self.receiveCommand()
   switch cmdName {
     case "HELLO":
@@ -584,13 +536,9 @@ func (self *socket) handshakePLAINAsServer() error {
   }
 }
 
-func (self *socket) validatePLAIN(username, password string) bool {
+func (self *session) validatePLAIN(username, password string) bool {
   // XXX TODO
   return true
-}
-
-func (self *socket) handshakeCURVE() error {
-  return fmt.Errorf("CURVE not supported")
 }
 
 func deserializeError(cmdData []byte) string {
@@ -606,10 +554,10 @@ func deserializeError(cmdData []byte) string {
   return string(cmdData[1:1+errMsgLen])
 }
 
-func (self *socket) getOutgoingMetadata() (md map[string]string) {
+func (self *session) getOutgoingMetadata() (md map[string]string) {
   md = map[string]string {}
 
-  md["Socket-Type"] = self.socketType
+  md["Socket-Type"] = self.sessionType
 
   if self.identity != "" {
     md["Identity"] = self.identity
@@ -620,19 +568,20 @@ func (self *socket) getOutgoingMetadata() (md map[string]string) {
   return
 }
 
-func (self *socket) processIncomingMetadata(md map[string]string) error {
+func (self *session) processIncomingMetadata(md map[string]string) error {
+  fmt.Printf("md: %+v\n", md)
   if ident, ok := md["Identity"]; ok {
     self.remoteIdentity = ident
   }
 
   if sockType, ok := md["Socket-Type"]; ok {
-    self.remoteSocketType = sockType
+    self.remoteSessionType = sockType
   } else {
     return fmt.Errorf("Peer did not specify a socket type.")
   }
 
-  if !socketTypesCompatible(self.socketType, self.remoteSocketType) {
-    return fmt.Errorf("Socket types are not compatible: %s, %s", self.socketType, self.remoteSocketType)
+  if !sessionTypesCompatible(self.sessionType, self.remoteSessionType) {
+    return fmt.Errorf("Session types are not compatible: %s, %s", self.sessionType, self.remoteSessionType)
   }
 
   // md["Resource"]
@@ -640,7 +589,7 @@ func (self *socket) processIncomingMetadata(md map[string]string) error {
   return nil
 }
 
-func socketTypesCompatible(localType string, remoteType string) bool {
+func sessionTypesCompatible(localType string, remoteType string) bool {
   /*
        | REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR |
 -------+-----+-----+--------+--------+-----+------+-----+------+------+------+------+
@@ -683,51 +632,4 @@ PAIR   |     |     |        |        |     |      |     |      |      |      |  
     default:
       return false
   }
-}
-
-func serializeMetadata(md map[string]string) []byte {
-  L := 0
-  for k,v := range md {
-    L += 5+len(k)+len(v)
-  }
-
-  buf := make([]byte, L)
-  i   := 0
-  for k,v := range md {
-    buf[i] = byte(len(k))
-    copy(buf[i+1:], []byte(k))
-    binary.BigEndian.PutUint32(buf[i+1+len(k):], uint32(len(v)))
-    copy(buf[i+5+len(k):], []byte(v))
-    i += 5+len(k)+len(v)
-  }
-
-  return buf
-}
-
-func deserializeMetadata(mdBuf []byte) (md map[string]string, err error) {
-  md = map[string]string {}
-  for len(mdBuf) > 0 {
-    if len(mdBuf) < 5 {
-      err = fmt.Errorf("Malformed metadata")
-      return
-    }
-
-    kLen := uint32(mdBuf[0])
-    if uint32(len(mdBuf)) < kLen+5 {
-      err = fmt.Errorf("Malformed metadata")
-      return
-    }
-
-    k := mdBuf[1:1+kLen]
-    vLen := binary.BigEndian.Uint32(mdBuf[1+kLen:])
-    if uint32(len(mdBuf)) < kLen+5+vLen {
-      err = fmt.Errorf("Malformed metadata")
-      return
-    }
-
-    v    := mdBuf[5+kLen:5+kLen+vLen]
-    md[string(k)] = string(v)
-    mdBuf = mdBuf[5+kLen+vLen:]
-  }
-  return
 }
