@@ -1,6 +1,8 @@
 ParaZMQ
 -------
 
+WORK IN PROGRESS: Support for doing CurveZMQ as a server is not currently present. Still needs refining.
+
 ParaZMQ is a pure-Go implementation of ZeroMQ 4.0's ZMTP/3.0.
 
 ParaZMQ supports NULL and PLAIN authentication as well as the CurveZMQ authentication and encryption protocol.
