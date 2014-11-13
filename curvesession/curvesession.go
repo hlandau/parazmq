@@ -2,10 +2,12 @@ package curvesession
 import "fmt"
 import "bytes"
 import "crypto/rand"
+import "crypto/subtle"
 import "encoding/binary"
 import "github.com/hlandau/parazmq/abstract"
 import "github.com/hlandau/parazmq/metadata"
 import "code.google.com/p/go.crypto/nacl/box"
+import "code.google.com/p/go.crypto/nacl/secretbox"
 import "code.google.com/p/go.crypto/curve25519"
 
 type CurveSession struct {
@@ -26,6 +28,9 @@ type CurveSession struct {
   curvest [32]byte // Server Transient Private      *
 
   curvemk  [32]byte // Precomputed Message Encryption Key
+
+  curveck  [32]byte    // Server cookie key
+  cookieNonce [16]byte // Server cookie nonce
 
   curveEngaged bool
   curveTxNonceCounter uint64
@@ -98,7 +103,76 @@ func (s *CurveSession) handshake() error {
 }
 
 func (s *CurveSession) handshakeAsServer() error {
-  return fmt.Errorf("CURVE not supported")
+  if keyIsZero(s.curves) {
+    return fmt.Errorf("Server private key not specified.")
+  }
+
+  // Generate our transient private key s' and our corresponding public key S'.
+  St, st, err := box.GenerateKey(rand.Reader)
+  if err != nil {
+    return err
+  }
+
+  s.curveSt = *St
+  s.curvest = *st
+
+  cmdName, cmdData, err := abstract.FCReceiveCommand(s.fc)
+  if err != nil {
+    return err
+  }
+
+  switch cmdName {
+    case "HELLO":
+      err := s.decodeHELLO(cmdData)
+      if err != nil {
+        return err
+      }
+
+      welcomeBuf, err := s.encodeWELCOME()
+      if err != nil {
+        return err
+      }
+
+      err = abstract.FCSendCommand(s.fc, "WELCOME", welcomeBuf)
+      if err != nil {
+        return err
+      }
+
+    case "ERROR":
+      return fmt.Errorf("Received error from remote peer")
+    default:
+      return fmt.Errorf("Unexpected command from remote peer: \"%s\"", cmdName)
+  }
+
+  cmdName, cmdData, err = abstract.FCReceiveCommand(s.fc)
+  if err != nil {
+    return err
+  }
+
+  switch cmdName {
+    case "INITIATE":
+      err := s.decodeINITIATE(cmdData)
+      if err != nil {
+        return err
+      }
+
+      readyBuf, err := s.encodeREADY()
+      if err != nil {
+        return err
+      }
+
+      err = abstract.FCSendCommand(s.fc, "READY", readyBuf)
+      if err != nil {
+        return err
+      }
+
+    case "ERROR":
+      return fmt.Errorf("Received error from remote peer")
+    default:
+      return fmt.Errorf("Unexpected command from remote peer: \"%s\"", cmdName)
+  }
+
+  return nil
 }
 
 func keyIsZero(k [32]byte) bool {
@@ -146,10 +220,6 @@ func (s *CurveSession) handshakeAsClient() error {
       cookie, err := s.decodeWELCOME(cmdData)
       if err != nil {
         return err
-      }
-
-      if len(cmdData) != 160 {
-        return fmt.Errorf("Received malformed WELCOME command from remote peer")
       }
 
       initiateBuf, err := s.encodeINITIATE(cookie, s.metadata)
@@ -213,6 +283,34 @@ func (s *CurveSession) encodeHELLO() (buf []byte, err error) {
   return
 }
 
+func (s *CurveSession) decodeHELLO(buf []byte) error {
+  if len(buf) != 194 {
+    return fmt.Errorf("Malformed HELLO command")
+  }
+
+  if buf[0] != 1 {
+    return fmt.Errorf("Unsupported CurveZMQ version")
+  }
+
+  Ct := [32]byte{}
+  copy(Ct[:], buf[74:106])
+
+  nonce := [24]byte{67,117,114,118,101,90,77,81,72,69,76,76,79,45,45,45,0,0,0,0,0,0,0,0}
+  copy(nonce[16:24], buf[106:114])
+  out, ok := box.Open(make([]byte,0), buf[114:194], &nonce, &Ct, &s.curves)
+  if !ok {
+    return fmt.Errorf("Malformed box in HELLO command")
+  }
+
+  if subtle.ConstantTimeCompare(out, z64) != 1 {
+    return fmt.Errorf("Nonzero box contents in HELLO command")
+  }
+
+  s.curveCt = Ct
+
+  return nil
+}
+
 func (s *CurveSession) decodeWELCOME(buf []byte) (cookie []byte, err error) {
   if len(buf) != 160 {
     err = fmt.Errorf("malformed curve WELCOME received")
@@ -226,7 +324,7 @@ func (s *CurveSession) decodeWELCOME(buf []byte) (cookie []byte, err error) {
 
   boxBuf  := buf[16:]
   boxData := make([]byte, 0)
-  boxData, ok   := box.Open(boxData, boxBuf, &nonce, &s.curveS, &s.curvect)
+  boxData, ok := box.Open(boxData, boxBuf, &nonce, &s.curveS, &s.curvect)
   if !ok {
     err = fmt.Errorf("Opening of WELCOME box failed.")
     return
@@ -236,6 +334,79 @@ func (s *CurveSession) decodeWELCOME(buf []byte) (cookie []byte, err error) {
   cookie = boxData[32:]
 
   return
+}
+
+func (s *CurveSession) encodeWELCOME() (buf []byte, err error) {
+  cookie, err := s.encodeCookie()
+  if err != nil {
+    return
+  }
+
+  // prefixed with "WELCOME-"
+  nonce := [24]byte{87,69,76,67,79,77,69,45, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+
+  _, err = rand.Read(nonce[8:24])
+  if err != nil {
+    return
+  }
+  nonce[8] = nonce[8] & 0x7f
+
+  boxData := make([]byte, 128)
+  copy(boxData[0:32], s.curveSt[:])
+  copy(boxData[32:128], cookie)
+
+  // ...
+  buf = make([]byte, 16, 160)
+  copy(buf[0:16], nonce[8:24])
+
+  buf = box.Seal(buf, boxData, &nonce, &s.curveCt, &s.curves)
+  return
+}
+
+func (s *CurveSession) encodeCookie() (buf []byte, err error) {
+  // prefixed with "COOKIE--"
+  nonce := [24]byte{67,79,79,75,73,69,45,45, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+
+  _, err = rand.Read(nonce[8:24])
+  if err != nil {
+    return
+  }
+
+  buf = make([]byte, 16, 96)
+  copy(buf[8:24], nonce[:])
+
+  _, err = rand.Read(s.curveck[:])
+  if err != nil {
+    return
+  }
+
+  boxData := make([]byte, 64)
+  copy(boxData[0:32], s.curveCt[:])
+  copy(boxData[32:64], s.curvest[:])
+
+  buf = secretbox.Seal(buf, boxData, &nonce, &s.curveck)
+  return
+}
+
+func (s *CurveSession) verifyCookie(cookie []byte) error {
+  // prefixed with "COOKIE--"
+  nonce := [24]byte{67,79,79,75,73,69,45,45, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+  copy(nonce[8:24], cookie[0:16])
+
+  boxData, ok := secretbox.Open(make([]byte,0), cookie[16:], &nonce, &s.curveck)
+  if !ok {
+    return fmt.Errorf("bad cookie")
+  }
+
+  correctBoxData := make([]byte, 64)
+  copy(correctBoxData[0:32], s.curveCt[:])
+  copy(correctBoxData[32:64], s.curvest[:])
+
+  if subtle.ConstantTimeCompare(boxData, correctBoxData) != 1 {
+    return fmt.Errorf("bad cookie box contents")
+  }
+
+  return nil
 }
 
 func (s *CurveSession) encodeINITIATE(cookie []byte, md map[string]string) (buf []byte, err error) {
@@ -267,6 +438,47 @@ func (s *CurveSession) encodeINITIATE(cookie []byte, md map[string]string) (buf 
   return
 }
 
+func (s *CurveSession) decodeINITIATE(buf []byte) error {
+  if len(buf) < 248 {
+    return fmt.Errorf("Malformed INITIATE command")
+  }
+
+  cookie := buf[0:96] // cookie
+  // Is the cookie even necessary? ...
+  err := s.verifyCookie(cookie)
+  if err != nil {
+    return err
+  }
+
+  s.curveck = [32]byte{}
+
+  nonce := [24]byte{67,117,114,118,101,90,77,81,73,78,73,84,73,65,84,69,0,0,0,0,0,0,0,0} // CurveZMQINITIATE
+  copy(nonce[16:24], buf[96:104])
+
+  boxData, ok := box.Open(make([]byte,0), buf[104:], &nonce, &s.curveCt, &s.curvest)
+  if !ok {
+    return fmt.Errorf("Malformed INITIATE box")
+  }
+
+  copy(s.curveC[:], boxData[0:32])
+  vouch := boxData[32:128]
+  mdBuf := boxData[128:]
+
+  err = s.decodeVouch(vouch)
+  if err != nil {
+    return err
+  }
+
+  md, err := metadata.Deserialize(mdBuf)
+  if err != nil {
+    return err
+  }
+
+  s.remoteMetadata = md
+
+  return nil
+}
+
 func (s *CurveSession) encodeVouch() (buf []byte, err error) {
   buf = make([]byte, 16)
 
@@ -281,6 +493,27 @@ func (s *CurveSession) encodeVouch() (buf []byte, err error) {
   copy(boxData[32:64], s.curveS[:])
   buf = box.Seal(buf, boxData, &nonce, &s.curveSt, &s.curvec)
   return
+}
+
+func (s *CurveSession) decodeVouch(vouch []byte) error {
+  nonce := [24]byte{86,79,85,67,72,45,45,45,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+  copy(nonce[8:24], vouch[0:16])
+
+  vbox := vouch[16:]
+  boxData, ok := box.Open(make([]byte,0), vbox, &nonce, &s.curveC, &s.curvest)
+  if !ok {
+    return fmt.Errorf("Malformed vouch box")
+  }
+
+  correctBoxData := make([]byte, 64)
+  copy(correctBoxData[0:32], s.curveCt[:])
+  copy(correctBoxData[32:64], s.curveS[:])
+
+  if subtle.ConstantTimeCompare(boxData, correctBoxData) != 1 {
+    return fmt.Errorf("Vouch box contains wrong keys")
+  }
+
+  return nil
 }
 
 func (s *CurveSession) decodeREADY(buf []byte) (md map[string]string, err error) {
@@ -307,6 +540,23 @@ func (s *CurveSession) decodeREADY(buf []byte) (md map[string]string, err error)
   if err != nil {
     return
   }
+
+  s.remoteMetadata = md
+
+  return
+}
+
+func (s *CurveSession) encodeREADY() (buf []byte, err error) {
+  // "CurveZMQREADY---"
+  nonce := [24]byte{67,117,114,118,101,90,77,81,82,69,65,68,89,45,45,45,0,0,0,0,0,0,0,0}
+  s.curveTxNonceCounter++
+  binary.BigEndian.PutUint64(nonce[16:24], s.curveTxNonceCounter)
+
+  buf = make([]byte, 8)
+  copy(buf[0:8], nonce[16:24])
+
+  boxData := metadata.Serialize(s.metadata)
+  buf = box.Seal(buf, boxData, &nonce, &s.curveCt, &s.curvest)
 
   return
 }
