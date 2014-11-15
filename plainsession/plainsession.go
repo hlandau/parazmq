@@ -4,6 +4,9 @@ import "fmt"
 import "github.com/hlandau/parazmq/abstract"
 import "github.com/hlandau/parazmq/metadata"
 
+// A PlainSession performs the PLAIN authentication mode handshake and exchanges
+// frames in the process so described by the specification. The ZMTP/3.x
+// greeting must already be complete.
 type PlainSession struct {
 	abstract.FrameConn
 	fc abstract.FrameConn
@@ -22,6 +25,7 @@ type PlainConfig struct {
 	ServerValidateFunc func(username, password string) bool
 }
 
+// Creates a PlainSession over the FrameConn as specified by the PlainConfig.
 func New(fc abstract.FrameConn, cfg PlainConfig) (ps abstract.FrameConn, err error) {
 	s := &PlainSession{}
 	s.fc = fc
@@ -192,6 +196,7 @@ func (s *PlainSession) ReceiveFrame() ([]byte, abstract.ZMTPFlags, error) {
 	return s.fc.ReceiveFrame()
 }
 
+// Returns the remote metadata received during the handshake process.
 func (s *PlainSession) RemoteMetadata() map[string]string {
 	return s.remoteMetadata
 }

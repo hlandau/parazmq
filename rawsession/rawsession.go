@@ -6,6 +6,11 @@ import "encoding/binary"
 import "fmt"
 import "github.com/hlandau/parazmq/abstract"
 
+// A raw ZMTP/3.x frame stream, to be used directly on top of a suitable
+// network socket. Other frame streams facilitating various security modes are
+// built on top of this basic ZMTP interface. RawSession does not perform
+// greeting or handshake phases, and so is instantiated after such phases are
+// complete.
 type RawSession struct {
 	abstract.FrameConn
 
@@ -15,8 +20,9 @@ type RawSession struct {
 	version abstract.ZMTPVersion
 }
 
-// Creates a FrameConn which sends and receives ZMTP/3 frames over a net.Conn.
-// The underlying connection must have already completed any greeting and handshake phases.
+// Creates a FrameConn which sends and receives ZMTP/3.x frames over a
+// net.Conn.  The underlying connection must have already completed any
+// greeting and handshake phases.
 func New(conn net.Conn, version abstract.ZMTPVersion) (rs *RawSession, err error) {
 	if version < abstract.ZMTP3_0 || version > abstract.ZMTP3_1 {
 		err = fmt.Errorf("unsupported version")
@@ -117,6 +123,8 @@ func (rs *RawSession) ReceiveFrame() (data []byte, flags abstract.ZMTPFlags, err
 	return
 }
 
+// RawSession always returns nil for RemoteMetadata(), as this is implemented
+// by higher-level constructs; namely, specific authentication modes.
 func (rs *RawSession) RemoteMetadata() map[string]string {
 	return nil
 }

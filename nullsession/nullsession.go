@@ -4,6 +4,9 @@ import "fmt"
 import "github.com/hlandau/parazmq/abstract"
 import "github.com/hlandau/parazmq/metadata"
 
+// A NullSession performs the NULL authentication mode handshake and exchanges
+// frames in the process so described by the specification. The ZMTP/3.x
+// greeting must already be complete.
 type NullSession struct {
 	abstract.FrameConn
 	fc abstract.FrameConn
@@ -19,6 +22,7 @@ type NullConfig struct {
 	Metadata map[string]string
 }
 
+// Creates a NullSession over the FrameConn as specified by the NullConfig.
 func New(fc abstract.FrameConn, cfg NullConfig) (ns abstract.FrameConn, err error) {
 	s := &NullSession{}
 	s.fc = fc
@@ -82,6 +86,7 @@ func (s *NullSession) ReceiveFrame() ([]byte, abstract.ZMTPFlags, error) {
 	return s.fc.ReceiveFrame()
 }
 
+// Returns the remote metadata received during the handshake process.
 func (s *NullSession) RemoteMetadata() map[string]string {
 	return s.remoteMetadata
 }

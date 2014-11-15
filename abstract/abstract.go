@@ -11,15 +11,15 @@ const (
 	ZMTP3_1             = 0x0301
 )
 
-// Flags
 
+// Flags used by the ZMTP framing protocol.
 type ZMTPFlags byte
 
 const (
 	ZF_None    ZMTPFlags = 0
-	ZF_More              = 1 << 0
+	ZF_More              = 1 << 0  // Set if the frame is not the last frame in the message.
 	zf_Long              = 1 << 1
-	ZF_Command           = 1 << 2
+	ZF_Command           = 1 << 2  // Set if the frame is a command.
 )
 
 // Are the flags valid?
@@ -36,17 +36,17 @@ func (flags ZMTPFlags) SendValid() bool {
 	return flags.Valid() && (flags&zf_Long) == 0
 }
 
-// FrameConn
-
+// An ordered bidirectional reliable frame stream. A frame is a sequence of
+// zero or more bytes plus the two metadata bits 'More' and 'Command'.
 type FrameConn interface {
 	// Closes the FrameConn. If this FrameConn has an underlying FrameConn,
 	// it shall be considered to own that FrameConn and so will close it as well.
 	Close() error
 
-	// Send a ZMTP frame across the underlying connection or FrameConn.
+	// Send a ZMTP frame across the connection.
 	SendFrame(data []byte, flags ZMTPFlags) error
 
-	// Receive a ZMTP frame from the underlying connection or FrameConn.
+	// Receive a ZMTP frame from the connection.
 	ReceiveFrame() ([]byte, ZMTPFlags, error)
 
 	// Gets the remote metadata, if any.
@@ -55,6 +55,11 @@ type FrameConn interface {
 
 // Message Helpers
 
+// Sends a message. A message is either a sequence of one or more frames, none
+// of which have the command bit set, or exactly one frame with the command bit
+// set. This function is used to send a non-command message. A message may not
+// consist of zero frames. If zero frames are passed, this function does
+// nothing.
 func FCSendMessage(rs FrameConn, msg [][]byte) error {
 	for i := range msg {
 		f := ZF_None
@@ -72,14 +77,20 @@ func FCSendMessage(rs FrameConn, msg [][]byte) error {
 
 // Command Helpers
 
-// Helper function to send a command over a FrameConn.
+// Sends a command message. A command message is a single frame with the
+// command bit set, with the frame data being the serialization of the tuple
+// (cmdName, cmdData) as defined in the ZMTP specification. cmdName shall be a
+// string between 1 and 255 bytes in length inclusive. cmdData shall be a
+// sequence of zero or more bytes.
 func FCSendCommand(rs FrameConn, cmdName string, cmdData []byte) error {
 	buf := SerializeCommand(cmdName, cmdData)
 
 	return rs.SendFrame(buf, ZF_Command)
 }
 
-// Helper function to send an ERROR command over a FrameConn.
+// Sends an error message. An error message is a command message with a command
+// name of "ERROR" and command data encoding an error message string as
+// specified in the ZMTP specification.
 func FCSendErrorCommand(rs FrameConn, errMsg string) error {
 	if len(errMsg) > 255 {
 		panic("error message too long")
@@ -91,9 +102,11 @@ func FCSendErrorCommand(rs FrameConn, errMsg string) error {
 	return FCSendCommand(rs, "ERROR", buf)
 }
 
-// Helper function to receive a command from a FrameConn.
+// Receives a command message from a FrameConn. The command message is
+// deserialized and the command name and command data are returned.
 //
-// If the next frame received is not a command, an error occurs.
+// If the next frame received from the FrameConn is not a command, an error
+// occurs.
 func FCReceiveCommand(rs FrameConn) (cmdName string, cmdData []byte, err error) {
 	d, flags, err := rs.ReceiveFrame()
 	if err != nil {
@@ -108,7 +121,7 @@ func FCReceiveCommand(rs FrameConn) (cmdName string, cmdData []byte, err error) 
 	return DeserializeCommand(d)
 }
 
-// Serialize a command.
+// Serializes the (cmdName, cmdData) tuple as specified by the ZMTP specification.
 func SerializeCommand(cmdName string, cmdData []byte) []byte {
 	if len(cmdName) > 255 {
 		panic("command name too long")
@@ -122,7 +135,7 @@ func SerializeCommand(cmdName string, cmdData []byte) []byte {
 	return buf
 }
 
-// Parse a command.
+// Deserializes command message data into the command name and command data.
 func DeserializeCommand(d []byte) (cmdName string, cmdData []byte, err error) {
 	if len(d) == 0 {
 		err = fmt.Errorf("Received a zero-length command frame.")
@@ -140,6 +153,7 @@ func DeserializeCommand(d []byte) (cmdName string, cmdData []byte, err error) {
 	return
 }
 
+// Deserializes error message data into the error message string.
 func DeserializeError(cmdData []byte) string {
 	if len(cmdData) == 0 {
 		return "(malformed ERROR command)"

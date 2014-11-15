@@ -3,6 +3,7 @@ package metadata
 import "fmt"
 import "encoding/binary"
 
+// Serializes a metadata dictionary as specified by the ZMTP specification.
 func Serialize(md map[string]string) []byte {
 	L := 0
 	for k, v := range md {
@@ -22,6 +23,7 @@ func Serialize(md map[string]string) []byte {
 	return buf
 }
 
+// Deserializes a metadata dictionary as specified by the ZMTP specification.
 func Deserialize(mdBuf []byte) (md map[string]string, err error) {
 	md = map[string]string{}
 	for len(mdBuf) > 0 {

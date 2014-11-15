@@ -19,6 +19,7 @@ var decoder [96]byte = [96]byte{
 	0x21, 0x22, 0x23, 0x4F, 0x00, 0x50, 0x00, 0x00,
 }
 
+// Decodes Z85 encoded data.
 func DecodeZ85(ks string) (k []byte, err error) {
 	if len(ks)%5 != 0 {
 		err = fmt.Errorf("malformed key")
@@ -48,6 +49,7 @@ func DecodeZ85(ks string) (k []byte, err error) {
 	return
 }
 
+// Decodes Z85 encoded data. The input string must be 40 bytes in length.
 func DecodeZ85Key(ks string) (k [32]byte, err error) {
 	if len(ks) != 40 {
 		err = fmt.Errorf("malformed key")
@@ -63,6 +65,7 @@ func DecodeZ85Key(ks string) (k [32]byte, err error) {
 	return
 }
 
+// Generate a random Ed25519 private key. Uses package rand.
 func GeneratePrivateKey() (k [32]byte, err error) {
 	_, err = io.ReadFull(rand.Reader, k[:])
 	if err != nil {

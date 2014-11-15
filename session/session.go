@@ -12,24 +12,44 @@ import "github.com/hlandau/parazmq/plainsession"
 import "github.com/hlandau/parazmq/curvesession"
 
 type SessionConfig struct {
+	// The session (socket) type to use for negotiation. e.g. "REQ".
 	SessionType   string
+
+	// The authentication mechanism to use for negotiation. e.g. "NULL".
 	AuthMechanism string
+
+	// Whether to take the server role for the purposes of the authentication
+	// process.
 	AuthIsServer  bool
+
+	// The identity string to report when negotiating the connection.
 	Identity      string
 
+	// Parameters used by the PLAIN authentication protocol.
 	AuthPlainUsername           string
 	AuthPlainPassword           string
 	AuthPlainServerValidateFunc func(username, password string) bool
 
+	// Parameters used by the CURVE authentication protocol.
 	AuthCurvek [32]byte
 	AuthCurveS [32]byte
 
+	// Dialer to use to make outgoing connections. If nil, net.Dial is used.
 	Dialer net.Dialer
 
+	// If set, this function will be called when the session receives a SUBSCRIBE
+	// command from the remote side.
 	SubscribeFunc func(name string) error
+
+	// If set, this function will be called when the session receives a CANCEL
+	// command from the remote side.
 	CancelFunc    func(name string) error
 }
 
+// Represents an OS-level connection to a peer. Thus a socket's lifetime is
+// characterised by the creation and destruction of zero or more Sessions.
+//
+// Not concurrency safe.
 type Session interface {
 	Close() error
 	Write(msg [][]byte) error
@@ -46,7 +66,8 @@ type session struct {
 	remoteIsServer bool
 }
 
-// Connect to an URL and establish a ZMTP session.
+// Connect to an URL (e.g. "tcp://127.0.0.1:1234") and establish a ZMTP
+// session.
 func Connect(URL string, cfg SessionConfig) (si Session, err error) {
 	u, err := url.Parse(URL)
 	if err != nil {
