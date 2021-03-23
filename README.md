@@ -20,7 +20,8 @@ ParaZMQ is internally structured as a layering of frame stream interfaces. A Raw
 Documentation
 -------------
 
-[See godoc.org.](http://godoc.org/github.com/hlandau/parazmq)
+[See godocs.io.](http://godocs.io/github.com/hlandau/parazmq)
+
 
 Licence
 -------
